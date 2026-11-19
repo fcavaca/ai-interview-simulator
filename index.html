@@ -89,18 +89,33 @@ function pickTopics() {
   return [a, b];
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function gemini(prompt) {
   const key = $('key').value.trim(), model = $('model').value;
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] },
-                           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-                           generationConfig: { temperature: 0.7 } })
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error ? j.error.message : ('HTTP ' + r.status));
-  return (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+  let lastErr = '';
+  for (let attempt = 0; attempt < 4; attempt++) {   // retry when the free tier is busy or rate-limited
+    if (attempt) await sleep(2000 * attempt);
+    let r, j;
+    try {
+      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] },
+                               contents: [{ role: 'user', parts: [{ text: prompt }] }],
+                               generationConfig: { temperature: 0.7 } })
+      });
+      j = await r.json().catch(() => ({}));
+    } catch (e) { lastErr = 'network error'; continue; }
+    if (r.ok) {
+      const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+      if (text) return text;
+      lastErr = 'empty reply from Gemini'; continue;
+    }
+    lastErr = j.error ? j.error.message : ('HTTP ' + r.status);
+    if (![429, 500, 502, 503, 504].includes(r.status)) break;   // e.g. a wrong key: no point retrying
+  }
+  throw new Error(lastErr);
 }
 
 function add(who, text, cls) {
@@ -140,7 +155,8 @@ $('start').onclick = async () => {
   $('start').disabled = true;
   try {
     const q1 = await gemini(`Study notes on the topic "${KB[t1].title}":\n\n${KB[t1].notes}\n\n` +
-      `Ask the candidate ONE basic interview question that tests understanding of a core concept in these notes (definition or simple explanation). ` +
+      `Ask the candidate ONE short, BASIC interview question about a single core concept in these notes, of the form "What is X?" or "What does X mean?". ` +
+      `Do not compare two concepts and do not use a scenario; that comes in the second question. ` +
       `Start with one short greeting sentence introducing yourself and saying there will be two questions, then the question. Output only that.`);
     state.q.push(q1); state.log.push(['Interviewer', q1]);
     add('Interviewer', q1);
@@ -153,18 +169,24 @@ $('send').onclick = async () => {
   const ans = $('answer').value.trim();
   if (!ans) return;
   $('sendErr').textContent = ''; $('send').disabled = true;
-  add('You', ans, 'you'); state.a.push(ans); state.log.push(['Candidate', ans]); $('answer').value = '';
+  const isFirst = state.a.length === 0;
+  const mine = add('You', ans, 'you');
+  let wait = null;
   try {
-    if (state.a.length === 1) {
+    if (isFirst) {
+      $('send').textContent = 'Waiting for the next question…';
       const t2 = state.t[1];
       const q2 = await gemini(`Study notes on the topic "${KB[t2].title}":\n\n${KB[t2].notes}\n\n` +
         `Ask the candidate ONE harder interview question on this topic: it should require explaining how/why, comparing, or applying the idea to a realistic business or accounting scenario. ` +
         `Start with a brief neutral acknowledgement like "Thanks." (do NOT say whether the previous answer was right), then the question. Output only that.`);
+      // only count the answer once the next question has actually arrived
+      state.a.push(ans); state.log.push(['Candidate', ans]); $('answer').value = '';
       state.q.push(q2); state.log.push(['Interviewer', q2]);
       add('Interviewer', q2); $('answer').focus();
     } else {
       $('answerBox').hidden = true;
-      const wait = add('Interviewer', 'Thanks, that was the last question. Preparing your feedback…');
+      state.a.push(ans); state.log.push(['Candidate', ans]); $('answer').value = '';
+      wait = add('Interviewer', 'Thanks, that was the last question. Preparing your feedback…');
       const fb = await gemini(
         `You interviewed a candidate with two questions. Grade them ONLY against the study notes below.\n\n` +
         `=== Notes for Q1 (${KB[state.t[0]].title}, source ${KB[state.t[0]].source}) ===\n${KB[state.t[0]].notes}\n\n` +
@@ -179,7 +201,15 @@ $('send').onclick = async () => {
       state.log.push(['Feedback', fb]);
       $('again').hidden = false;
     }
-  } catch (e) { $('sendErr').textContent = 'Gemini error: ' + e.message; $('answerBox').hidden = false; }
+  } catch (e) {
+    // undo this attempt so the same answer can simply be sent again
+    mine.remove(); if (wait) wait.remove();
+    if (!isFirst) { state.a.pop(); state.log.pop(); }
+    $('answer').value = ans; $('answerBox').hidden = false;
+    $('sendErr').textContent = 'Gemini did not respond (' + e.message + '). Your answer is still in the box: wait a few seconds and click "Send answer" again.';
+    $('answerBox').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  $('send').textContent = 'Send answer';
   $('send').disabled = false;
 };
 
